@@ -1,19 +1,18 @@
-# Example: how to mount Project Memory from a profile's user patch layer.
-# Append this to $DSH_HOME/profiles/<your-profile>/cordis.patch.yml and restart dsh.
+# Bundle patch layer.
 #
-# It is HOST-PLANE on purpose: the records back every session of a project, so a
-# preset realm (an entry-local instance per session) would give each session its
-# own copy and defeat the feature.
+# dsh applies this over the base composition of every profile whose
+# `dsh.profile.bundles` lists this package. `dsh plugin --profile <name> add`
+# appends it there by itself, so this file IS the whole mount.
 #
-# The row name is a LITERAL absolute path, never a `!!js` expression. This layer
-# is anchored by `anchorInsertedPluginNames`, which only rewrites a `name` it can
-# prove is a string; a `!!js` scalar arrives as a `{__jsExpr}` object, skips that
-# rewrite, and reaches the Loader's import as an object — booting then fails with
-# `name.startsWith is not a function`. (`!!js` is for `config` values, which the
-# Loader interpolates per entry; a row's `name` is consumed to resolve the module
-# before any such interpolation.)
+# HOST-PLANE on purpose: the records back every session of a project, so a
+# preset realm (one instance per session) would give each session its own copy
+# and defeat the feature.
 #
-# Replace the path below with the absolute location of index.js on YOUR machine.
+# The row name is a BARE PACKAGE NAME, which resolves from the profile
+# directory's node_modules, where `dsh plugin add` installed this package. Never
+# write it as a `!!js` expression: a row's name is resolved to a module before
+# any interpolation, and a non-string name crashes the boot with
+# `name.startsWith is not a function`.
 - insert:
     - id: project-memory
-      name: 'REPLACE/WITH/YOUR/DSH_HOME/profiles/dsh-project-memory/index.js'
+      name: dsh-project-memory

@@ -92,24 +92,34 @@ row) the entries are also logged at info level.
 
 ## Install
 
-1. Put `index.js` and `package.json` in
-   `$DSH_HOME/profiles/dsh-project-memory/`. Its `@deepseek-ai/*` imports resolve
-   through `$DSH_HOME/profiles/node_modules`, so there is no install step.
-2. Add ONE row to your profile's user patch layer,
-   `$DSH_HOME/profiles/<profile>/cordis.patch.yml` (see `cordis.patch.yml` here
-   for the commented template):
-
-```yaml
-- insert:
-    - id: project-memory
-      name: '/absolute/path/to/profiles/dsh-project-memory/index.js'
+```sh
+dsh plugin --profile web add github:yuyuyyyyyyyyyyyy/dsh-project-memory
 ```
 
+Then restart `dsh`. That is the whole install. This package declares
+`dsh.bundle.patch`, so `dsh plugin` appends it to the profile's
+`dsh.profile.bundles`, and the bundle's own `cordis.patch.yml` mounts the plugin
+host-side. Swap `web` for your profile name; swap `github:` for a registry name,
+a tarball, or a local path if you prefer.
+
+`dsh plugin` is a thin `pnpm` forwarder, so `pnpm` has to be on `PATH`
+(`corepack enable pnpm`, or `npm i -g pnpm`). This package ships no install
+scripts, so there is nothing pnpm has to be allowed to build.
+
+<details>
+<summary>Manual install, no pnpm</summary>
+
+1. Put this directory at `$DSH_HOME/profiles/node_modules/dsh-project-memory/`,
+   or anywhere else under `$DSH_HOME/profiles/` that Node's `node_modules` walk
+   reaches from the profile directory.
+2. Add `"dsh-project-memory"` to the `dsh.profile.bundles` array in
+   `$DSH_HOME/profiles/<profile>/package.json`.
 3. Restart `dsh`.
 
-The name must be an **absolute path**: a bare package name does not resolve (the
-harness's package graph does not contain this package), and a `./relative` name
-resolves against the patch file's own directory.
+A bare package name resolves from the profile directory's `node_modules`; a
+`./relative` name resolves against the patch file's own directory; a `!!js`
+name crashes the boot (see *Deployment constraints*).
+</details>
 
 ## Deployment constraints
 
@@ -135,16 +145,25 @@ Learned by hitting them; they are also in the memory this plugin manages.
 Every key is optional:
 
 ```yaml
+```yaml
 - insert:
     - id: project-memory
-      name: '/absolute/path/to/profiles/dsh-project-memory/index.js'
+      name: dsh-project-memory
       config:
         maxRecallRecords: 3
         maxRecallChars: 2600
         perRecordChars: 900
         minScore: 3
         auditLimit: 50
+        leaseWaitMs: 4000
+        leaseStaleMs: 30000
+        storeDir: ''
         debug: false
+```
+
+`storeDir` defaults to `$DSH_HOME/storages/dsh_project_memory` — the shell's own
+layout, which the write lease and the record reads depend on. Set it only if the
+storage backend's root is somewhere else.
 ```
 
 ## Storage
@@ -161,6 +180,10 @@ The domain uses the `per-record` layout with `invalidRecords: 'backup-and-skip'`
 so one damaged document can never cost the whole store. Each document is a
 versioned envelope `{ version, record }`.
 
+`$DSH_HOME/storages/dsh_project_memory/.leases/<project-id>.lock` sits beside
+them: the exclusive-create lock that serializes writers across processes (see
+*Concurrent writers*). It is not a document, so the per-record loader ignores it.
+
 ## Tests
 
 `test.mjs` mounts the plugin through a real Cordis Loader over a real composition
@@ -171,9 +194,11 @@ system-prompt registry. Only the storage medium is faked
 ```sh
 # the dependency mirror inside the installed harness
 export DSH_PLUGIN_DEPS="$DSH_HOME/profiles/node_modules"
-node --import ./register-deps.mjs test.mjs          # 74 checks
-node --import ./register-deps.mjs loader.test.mjs    # 6 checks
-node --import ./register-deps.mjs regression.test.mjs # 10 checks
+node --import ./register-deps.mjs test.mjs                   # 78 checks
+node --import ./register-deps.mjs lease.test.mjs             # 9 checks, 3 processes
+node --import ./register-deps.mjs loader.test.mjs            # 6 checks
+node --import ./register-deps.mjs regression.test.mjs        # 10 checks
+node --import ./register-deps.mjs regression-forget.test.mjs # 15 checks
 ```
 
 `test.mjs` covers: first encounter with no history, write (including rejection of
@@ -191,9 +216,49 @@ reintroduce:
   meaningful in favour of a replacement — without one the stale text would keep
   reaching later sessions.
 
+## Concurrent writers
+
+Several `dsh` processes can share one `$DSH_HOME` — they cannot share one
+*session*, but they can each own a different one — and every one of them writes
+the same project store. Writes are serialized rather than hoped not to collide.
+
+Before each mutation the plugin takes
+`<store>/.leases/<project-id>.lock` with an exclusive create (`wx`), so the
+filesystem admits exactly one holder. Inside that hold it re-reads the record
+**document** instead of trusting its own in-memory copy, bumps that revision, and
+writes. The lock file names its holder, so a rival process can see who is writing
+which record, and `memory_audit` logs `write-waited` / `write-conflict`.
+
+Measured with three OS processes (`lease.test.mjs`: two writers, 40 updates each
+on one record, plus an independent verifier):
+
+| | revision after 80 updates | writes failed |
+|---|---|---|
+| no lease | 41 — one writer's whole lineage, half the updates gone | 3 |
+| with lease | 81 — every update survived | 0 |
+
+Two invariants keep the coordination from becoming the failure:
+
+- **A lease that cannot be taken never fails the write.** If the lock cannot be
+  created — read-only store, a sandbox that denies it — the write proceeds
+  uncoordinated and the degradation is audited once as `write-lease-unavailable`.
+- **The index is unioned with memory, never replaced by the medium.** A store this
+  process cannot see whole must not be able to empty a good index.
+
+The lock is a file, not a kernel lock: a process killed mid-write leaves it
+behind, so a lease older than `leaseStaleMs` (30 s) is stolen. A transient
+`EPERM`/`EBUSY` from the medium — on Windows, another process simply holding a
+record file open during a rename — is retried instead of surfacing.
+
+`lease.test.mjs` is the cross-process suite: it spawns two rival writer
+processes and one verifier over a real JSON store, and asserts that all 80
+updates survive, that no write failed, that every lease was released, and that a
+fresh process sees the final state. It fails (revision 41) against a build
+without the lease, which is how the fix was proven.
+
 ## Status
 
-Offline suites pass against the real DSH modules (74 + 6 checks). On a live
+Offline suites pass against the real DSH modules (78 + 9 + 6 + 10 + 15 checks). On a live
 project the full chain has been observed: a conclusion is produced, recorded
 **autonomously** (no instruction to remember anything appears in the prompt), the
 record lands in the JSON backend, a later session's first prompt already carries
@@ -216,6 +281,10 @@ yet been exercised end-to-end on a live record that later proved wrong.
 - **Precision is preferred over recall.** `minScore` (default 3) drops weak
   candidates silently; a marginal record can miss injection at score ≈ 4.
 - **The audit trail is in-memory** — bounded, lost on restart.
+- **A second process's in-memory view stays stale until it reopens.** The lease
+  makes concurrent *writes* safe; reads still come from the table the domain
+  seeded at open, so a record another process added mid-session is listed in the
+  index but resolves to nothing here until this process restarts.
 - **Project identity is the working directory**, so one repository opened from
   two different directories (its root in one session, a subdirectory in another)
   is treated as two projects. Records do not cross that line. Anchor sessions at

@@ -96,6 +96,10 @@ function composition(rows) {
  * facility always finds its backend lifecycle key.
  */
 async function boot(pluginConfig = {}) {
+	// The plugin reads the store directory directly — for its write lease and for
+	// the record documents — so an out-of-tree test must pin it to a temp store.
+	// The default is the real $DSH_HOME store.
+	const storeDir = pluginConfig.storeDir ?? mkdtempSync(join(tmpdir(), 'dsh-memory-store-'))
 	const root = new Context()
 	const loader = new Loader(root)
 	await root.plugin((ctx) => {
@@ -125,7 +129,7 @@ async function boot(pluginConfig = {}) {
 		{ id: 'storage-domain', name: '@deepseek-ai/dsh-storage-domain', config: { backend: 'memory' } },
 		{ id: 'tools', name: '@deepseek-ai/dsh-tools' },
 		{ id: 'system-prompt', name: '@deepseek-ai/dsh-system-prompt' },
-		{ id: 'project-memory', name: PLUGIN, config: Object.keys(pluginConfig).length > 0 ? pluginConfig : undefined },
+		{ id: 'project-memory', name: PLUGIN, config: { ...pluginConfig, storeDir } },
 	])
 	await loader.create({ id: 'root', name: 'cordis:include', config: { path: pathToFileURL(file).href } })
 	await loader.await()
@@ -424,6 +428,7 @@ async function main() {
 
 	// ── I. restart over the same medium ────────────────────────────────────────
 	console.log('\nI. the same medium serves a fresh process')
+	let restartedBoot
 	{
 		const domain = root.get('storage').domain.get('dsh_project_memory')
 		check('I1 the domain is open on the storage facility', domain !== undefined)
@@ -440,7 +445,8 @@ async function main() {
 		await new Promise((resolve) => setTimeout(resolve, 20))
 		check('I3 the first tree released its domain unit', medium.open.has('dsh_project_memory') === false, JSON.stringify([...medium.open]))
 
-		const { root: restarted } = await boot()
+		restartedBoot = await boot()
+		const restarted = restartedBoot.root
 		const revived = await waitFor(() => restarted.get('projectMemory'))
 		check('I4 the plugin remounts over the existing medium', revived !== undefined)
 		if (revived !== undefined) {
@@ -448,6 +454,30 @@ async function main() {
 			check('I6 a new session still recalls the relevant record', revived.recall(sessionA2).records.some((entry) => entry.record.id === replacementId))
 			check('I7 the superseded record is still superseded after reload', revived.get(wrongRecordId).status === 'superseded')
 			check('I8 the other project is still isolated after reload', revived.allForProject(created.project).every((record) => record.project === created.project))
+		}
+	}
+
+	// ── J. coordination must never be the reason a write fails ─────────────────
+	console.log('\nJ. an unusable lease degrades instead of failing')
+	{
+		// The fake medium admits ONE live handle per unit, exactly like the real
+		// backend, so the tree section I booted has to release it first.
+		await restartedBoot.loader.remove('root')
+		await new Promise((resolve) => setTimeout(resolve, 20))
+		const blocker = join(mkdtempSync(join(tmpdir(), 'dsh-memory-block-')), 'not-a-directory')
+		writeFileSync(blocker, 'a file where a directory would have to go')
+		const { root: degraded } = await boot({ storeDir: join(blocker, 'nested') })
+		const degradedMemory = await waitFor(() => degraded.get('projectMemory'))
+		check('J1 the plugin mounts with an unusable store directory', degradedMemory !== undefined)
+		if (degradedMemory !== undefined) {
+			const session = fakeSession('session-j1', PROJECT_A, ['SYM-1 的故障复现了'])
+			const first = await tool(degraded, 'memory_record').execute({ problem: 'LEASE-UNAVAILABLE-1', conclusion: 'inferred' }, { agent: fakeAgent(session) })
+			check('J2 a write still succeeds when no lease can be taken', typeof first.record_id === 'string', JSON.stringify(first))
+			const second = await tool(degraded, 'memory_record').execute({ problem: 'LEASE-UNAVAILABLE-2', conclusion: 'inferred' }, { agent: fakeAgent(session) })
+			check('J3 the next write succeeds too', typeof second.record_id === 'string')
+			const audit = await tool(degraded, 'memory_audit').execute({ limit: 200 })
+			const unavailable = audit.entries.filter((entry) => entry.action === 'write-lease-unavailable')
+			check('J4 the degradation is reported exactly once', unavailable.length === 1, String(unavailable.length))
 		}
 	}
 

@@ -1,11 +1,37 @@
 {
   "name": "dsh-project-memory",
-  "version": "1.0.0",
-  "private": true,
+  "version": "1.1.0",
   "type": "module",
   "description": "Cross-session project engineering memory for DSH coding agents: durable per-project records of problems, failed attempts, verified root causes and constraints, recalled automatically before the agent plans.",
   "main": "index.js",
   "exports": {
     ".": "./index.js"
-  }
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yuyuyyyyyyyyyyyy/dsh-project-memory.git"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "coding-agent",
+    "agent-memory",
+    "context-engineering"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ]
 }

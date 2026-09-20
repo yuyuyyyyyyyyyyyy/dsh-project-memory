@@ -21,6 +21,9 @@
  */
 
 import { createHash } from 'node:crypto'
+import { mkdir, open, readFile, readdir, rm, stat } from 'node:fs/promises'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 import { Service } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { z as zod } from 'zod'
@@ -62,6 +65,123 @@ const PROBLEM_CHARS = 160
 
 /** How long each failed-attempt / constraint line may be. */
 const LINE_CHARS = 120
+
+/** Record ids become path segments in the store; nothing else may be read by name. */
+const SAFE_RECORD_ID = /^[a-zA-Z0-9_-]+$/
+
+/** Poll interval while waiting for another process to release a write lease. */
+const LEASE_POLL_MS = 20
+
+/** Lock-file suffix inside the lease directory. */
+const LEASE_SUFFIX = '.lock'
+
+/**
+ * Medium failures a concurrent file reader can cause on Windows. A record write
+ * is idempotent, so retrying one costs less than failing a memory write because
+ * something else happened to have the file open.
+ */
+const TRANSIENT_WRITE_CODES = new Set(['EPERM', 'EACCES', 'EBUSY'])
+
+/** Wait one moment between lease attempts. */
+function delay(ms) {
+	return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+/**
+ * The store directory this plugin's records occupy.
+ *
+ * `ctx.storageDomain.open` hands back table handles and never says WHERE the
+ * backend put them, yet a cross-process lease has to sit beside the records it
+ * guards. The shell layout is `$DSH_HOME/storages/<domain>`, which every dsh
+ * process on one home derives identically, so both processes agree without
+ * either being able to ask the storage layer. `storeDir` overrides it for a
+ * deployment that moved the storage root.
+ * @param override - the configured store directory, when any.
+ * @returns the absolute unit directory.
+ */
+function storeDirOf(override) {
+	if (typeof override === 'string' && override.length > 0) return override
+	return join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'storages', DOMAIN_NAME)
+}
+
+/**
+ * Take one project's write lease: an exclusively created lock file naming its holder.
+ *
+ * `wx` IS the mutual exclusion — the filesystem admits exactly one creator, so
+ * two processes can never both believe they hold it. The file also records WHO
+ * is writing WHAT, which is what turns silent contention into something a rival
+ * process (or `memory_audit`) can see. A holder that dies leaves the file
+ * behind, so a lease older than `staleMs` is stolen rather than trusted forever.
+ * @param dir - the lease directory.
+ * @param key - the project key (already path-safe).
+ * @param holder - the facts written into the lock for a rival to read.
+ * @param waitMs - how long to wait for a rival before writing anyway.
+ * @param staleMs - age after which an abandoned lease may be stolen.
+ * @returns the held lease; `timedOut` means no lease was taken.
+ */
+async function acquireLease(dir, key, holder, waitMs, staleMs) {
+	try {
+		await mkdir(dir, { recursive: true })
+	} catch {
+		// A lease is coordination, not the write itself: a store this process may
+		// not create a lock in must still accept the record.
+		return { path: undefined, waited: 0, unavailable: true }
+	}
+	const path = join(dir, key + LEASE_SUFFIX)
+	const body = JSON.stringify(holder) + '\n'
+	// Measured from the FIRST refusal, not from entry: taking an uncontended lease
+	// costs a write and an fsync, and counting that as "waited for a rival" would
+	// report contention on every single write.
+	let contendedAt
+	for (;;) {
+		try {
+			const handle = await open(path, 'wx', 0o600)
+			try {
+				await handle.writeFile(body, 'utf8')
+				await handle.sync()
+			} finally {
+				await handle.close()
+			}
+			return { path, waited: contendedAt === undefined ? 0 : Date.now() - contendedAt }
+		} catch (error) {
+			if (error?.code !== 'EEXIST') return { path: undefined, waited: 0, unavailable: true }
+			contendedAt ??= Date.now()
+			const info = await stat(path).catch(() => undefined)
+			if (info !== undefined && Date.now() - info.mtimeMs > staleMs) {
+				await rm(path, { force: true }).catch(() => {})
+				continue
+			}
+			const waited = Date.now() - contendedAt
+			if (waited >= waitMs) return { path, waited, timedOut: true }
+			await delay(LEASE_POLL_MS)
+		}
+	}
+}
+
+/** Release one held lease. A writer that never took the lease has nothing to release. */
+async function releaseLease(held) {
+	if (held === undefined || held.timedOut === true || held.path === undefined) return
+	await rm(held.path, { force: true }).catch(() => {})
+}
+
+/**
+ * Retry a medium write that a concurrent reader interrupted.
+ * @param operation - the write.
+ * @param attempts - how many times to try before giving up.
+ * @returns the write's value.
+ */
+async function writeWithRetry(operation, attempts = 6) {
+	let wait = 20
+	for (let attempt = 1; ; attempt++) {
+		try {
+			return await operation()
+		} catch (error) {
+			if (attempt >= attempts || TRANSIENT_WRITE_CODES.has(error?.code) === false) throw error
+			await delay(wait)
+			wait *= 2
+		}
+	}
+}
 
 /** Locale-independent code-unit compare, matching the harness convention. */
 function compareNames(a, b) {
@@ -449,6 +569,9 @@ const Config = z.object({
 	perRecordChars: z.natural().min(200).default(900),
 	minScore: z.number().default(3),
 	auditLimit: z.natural().min(1).default(50),
+	leaseWaitMs: z.natural().default(4000),
+	leaseStaleMs: z.natural().default(30000),
+	storeDir: z.string().default(''),
 })
 
 /** The standing usage contract, routed through every assembly. */
@@ -482,11 +605,18 @@ class ProjectMemory extends Service {
 	constructor(ctx, config) {
 		super(ctx, 'projectMemory')
 		this.config = config
+		this.storeDir = storeDirOf(config.storeDir)
+		this.recordsDir = join(this.storeDir, 'records')
+		this.leaseDir = join(this.storeDir, '.leases')
 	}
 
 	table
 	indexTable
 	audit = []
+	storeDir
+	recordsDir
+	leaseDir
+	leaseWarned = false
 
 	/** Open the domain, rebuild the id index, then install the context, section, and tools. */
 	async [Service.init]() {
@@ -512,6 +642,111 @@ class ProjectMemory extends Service {
 	requireTable() {
 		if (this.table === undefined) throw new Error('project memory is not initialized')
 		return this.table
+	}
+
+	/**
+	 * Run one mutating operation while holding this project's write lease.
+	 *
+	 * The lease is what turns an update into a read-modify-write against the
+	 * MEDIUM: a rival's write either finished before this one reads, or it waits.
+	 * It is deliberately best-effort — a writer that cannot take the lease within
+	 * `leaseWaitMs` proceeds and records the conflict, because refusing to store
+	 * an engineering conclusion is worse than a rare lost update.
+	 * @param project - the project key.
+	 * @param detail - the record and action, written into the lock for a rival.
+	 * @param operation - the mutation to run.
+	 * @returns the operation's value.
+	 */
+	async withProjectWrite(project, detail, operation) {
+		const holder = { pid: process.pid, project, ...detail, started_at: Date.now() }
+		const held = await acquireLease(this.leaseDir, project, holder, this.config.leaseWaitMs, this.config.leaseStaleMs)
+		if (held.unavailable === true) {
+			if (this.leaseWarned !== true) {
+				this.leaseWarned = true
+				this.recallHook('write-lease-unavailable', { project, lease_dir: this.leaseDir })
+				this.ctx.logger.warn('project memory: cannot create a write lease in ' + this.leaseDir + '; writes are uncoordinated across processes')
+			}
+		} else if (held.timedOut) {
+			this.recallHook('write-conflict', { ...holder, waited_ms: held.waited })
+			this.ctx.logger.warn('project memory: another process held the write lease for "' + project + '" for ' + held.waited + 'ms; writing without it')
+		} else if (held.waited > 0) {
+			this.recallHook('write-waited', { ...holder, waited_ms: held.waited })
+		}
+		try {
+			return await operation()
+		} finally {
+			await releaseLease(held)
+		}
+	}
+
+	/** Absolute path of one record's document inside the store. */
+	recordPath(recordId) {
+		return join(this.recordsDir, recordId + '.json')
+	}
+
+	/**
+	 * One record as the MEDIUM holds it, bypassing this process's memory.
+	 *
+	 * The domain layer reads from a table seeded when the domain opened, so a
+	 * record another process revised afterwards is invisible here. Reading the
+	 * document itself is the only way to see the current revision. Anything
+	 * unreadable, foreign, or stamped with a version this build does not know
+	 * reads as "no answer", and the caller falls back to memory.
+	 * @param recordId - the record id.
+	 * @returns the stored record, or undefined.
+	 */
+	async readStoredRecord(recordId) {
+		if (SAFE_RECORD_ID.test(recordId) === false) return undefined
+		try {
+			const document = JSON.parse(await readFile(this.recordPath(recordId), 'utf8'))
+			if (document === null || typeof document !== 'object' || document.version !== RECORD_VERSION) return undefined
+			if (document.record === null || typeof document.record !== 'object') return undefined
+			return document.record
+		} catch {
+			return undefined
+		}
+	}
+
+	/**
+	 * Every record the medium holds.
+	 *
+	 * undefined means the tree could not be read whole — a different backend, a
+	 * store that does not exist yet, or a document a rival was renaming at that
+	 * instant. The caller then uses its memory, which never reports a record as
+	 * gone merely because a read raced a write.
+	 * @returns the records, or undefined.
+	 */
+	async listStoredRecords() {
+		let entries
+		try {
+			entries = await readdir(this.recordsDir, { withFileTypes: true })
+		} catch {
+			return undefined
+		}
+		const records = []
+		for (const entry of entries) {
+			if (entry.isFile() === false || entry.name.endsWith('.json') === false) continue
+			const record = await this.readStoredRecord(entry.name.slice(0, -'.json'.length))
+			if (record === undefined) return undefined
+			if (typeof record.id === 'string') records.push(record)
+		}
+		return records
+	}
+
+	/**
+	 * One record, preferring this process's table and consulting the medium only
+	 * for an id the table has never seen — the case where another process wrote
+	 * the record after this one opened.
+	 * @param recordId - the record id.
+	 * @returns the record, or undefined.
+	 */
+	async resolveRecord(recordId) {
+		const local = this.requireTable().get(recordId)
+		if (local !== undefined) return local
+		const stored = await this.readStoredRecord(recordId)
+		if (stored === undefined) return undefined
+		await writeWithRetry(() => this.requireTable().put(recordId, stored)).catch(() => {})
+		return stored
 	}
 
 	/**
@@ -731,9 +966,11 @@ class ProjectMemory extends Service {
 			session_id: origin.session_id ?? '',
 			cwd: origin.cwd ?? '',
 		}
-		await table.put(id, record)
-		await this.reindex(record.project)
-		return record
+		return this.withProjectWrite(record.project, { record: id, action: 'record' }, async () => {
+			await writeWithRetry(() => table.put(id, record))
+			await this.reindex(record.project)
+			return record
+		})
 	}
 
 	/**
@@ -744,17 +981,25 @@ class ProjectMemory extends Service {
 	 * @returns the updated record.
 	 */
 	async markRevised(recordId, status, supersededBy) {
-		const table = this.requireTable()
-		if (table.get(recordId) === undefined) throw new Error('no project memory record "' + recordId + '"')
-		const updated = await table.update(recordId, (current) => ({
-			...current,
-			status,
-			superseded_by: supersededBy ?? current.superseded_by,
-			revision: current.revision + 1,
-			revised_at: Date.now(),
-		}))
-		await this.reindex(updated.project)
-		return updated
+		const existing = await this.resolveRecord(recordId)
+		if (existing === undefined) throw new Error('no project memory record "' + recordId + '"')
+		return this.withProjectWrite(existing.project, { record: recordId, action: 'revise' }, async () => {
+			// Under the lease the medium is authoritative: the revision this process
+			// remembers may predate a rival's update, and bumping that stale number is
+			// exactly how an update disappears.
+			const current = (await this.readStoredRecord(recordId)) ?? existing
+			const revision = typeof current.revision === 'number' ? current.revision : 1
+			const updated = {
+				...current,
+				status,
+				superseded_by: supersededBy ?? current.superseded_by,
+				revision: revision + 1,
+				revised_at: Date.now(),
+			}
+			await writeWithRetry(() => this.requireTable().put(recordId, updated))
+			await this.reindex(updated.project)
+			return updated
+		})
 	}
 
 	/**
@@ -769,11 +1014,13 @@ class ProjectMemory extends Service {
 	 * @returns the dropped record, or undefined when no such record exists.
 	 */
 	async forget(recordId) {
-		const record = this.requireTable().get(recordId)
+		const record = await this.resolveRecord(recordId)
 		if (record === undefined) return undefined
-		await this.requireTable().delete(recordId)
-		await this.reindex(record.project)
-		return record
+		return this.withProjectWrite(record.project, { record: recordId, action: 'forget' }, async () => {
+			await writeWithRetry(() => this.requireTable().delete(recordId))
+			await this.reindex(record.project)
+			return record
+		})
 	}
 
 	/**
@@ -782,10 +1029,22 @@ class ProjectMemory extends Service {
 	 */
 	async reindex(project) {
 		const table = this.requireTable()
+		// Two processes share the store but not their memories, so a rival's
+		// records must come from the medium. The medium is UNIONED with memory
+		// rather than trusted outright: a store this process cannot see whole
+		// (another backend, a moved root) must not be able to empty a good index.
+		const stored = await this.listStoredRecords()
 		const ids = []
-		for (const [id, record] of table.entries()) if (record.project === project) ids.push(id)
-		ids.sort((left, right) => (table.get(right)?.created_at ?? 0) - (table.get(left)?.created_at ?? 0) || compareNames(left, right))
-		await this.indexTable.put(project, { ids })
+		const stamps = new Map()
+		const add = (record) => {
+			if (record.project !== project || stamps.has(record.id)) return
+			ids.push(record.id)
+			stamps.set(record.id, typeof record.created_at === 'number' ? record.created_at : 0)
+		}
+		for (const [, record] of table.entries()) add(record)
+		for (const record of stored ?? []) add(record)
+		ids.sort((left, right) => (stamps.get(right) ?? 0) - (stamps.get(left) ?? 0) || compareNames(left, right))
+		await writeWithRetry(() => this.indexTable.put(project, { ids }))
 	}
 
 	/** Register the four model-facing tools. */

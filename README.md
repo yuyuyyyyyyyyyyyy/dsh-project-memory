@@ -281,11 +281,17 @@ without the lease, which is how the fix was proven.
 ## Status
 
 **Available beta, for low-concurrency personal use.** Offline suites pass against
-the real DSH modules (78 + 23 + 9 + 6 + 10 + 15 = 141 checks). On a live project
+the real DSH modules (78 + 27 + 9 + 6 + 10 + 15 = 145 checks). On a live project
 the full chain has been observed: a conclusion is produced, recorded
 **autonomously** (no instruction to remember anything appears in the prompt), the
 record lands in the JSON backend, a later session's first prompt already carries
-it, and a fresh session reuses it.
+it, and a fresh session reuses it. `memory_correct` has now been exercised on a
+live record as well — and that run is what found the eighth defect: a correction
+*without* a replacement wrote `replacement_id: undefined` into its audit entry,
+and because a tool result must be lossless JSON, the harness then rejected **every
+`memory_audit` call** for the rest of that process. Fixed at the source
+(`?? null`) and again at the tool boundary; `regression-consistency.test.mjs`
+R7–R10 pin both.
 
 An independent audit then reproduced seven consistency defects against `ba4778a`:
 a deleted record coming back and ghost ids in the index, a lease holder deleting
@@ -298,9 +304,7 @@ fix.
 
 What this is **not**: a strict cross-process consistency guarantee. Coordination
 is best-effort by design (see *Concurrent writers*), and `releaseLease` carries a
-known, unreproduced TOCTOU risk (see *Known limitations*). `memory_correct` has
-unit coverage but has not yet been exercised end-to-end on a live record that
-later proved wrong.
+known, unreproduced TOCTOU risk (see *Known limitations*).
 
 Migrating the lease to the harness's internal `flock` addon — which would give
 handle-owned locks and kernel cleanup of dead holders — is **deliberately not

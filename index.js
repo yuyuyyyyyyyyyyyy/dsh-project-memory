@@ -1512,7 +1512,10 @@ function installCorrectTool(service) {
 				record_id: revised.id,
 				project: revised.project,
 				status: revised.status,
-				replacement_id: replacement?.id,
+				// `undefined` is not JSON: one such field makes the harness reject the
+				// whole tool result, and memory_audit then stayed broken for the rest of
+				// the process after any invalidated/confirmed correction.
+				replacement_id: replacement?.id ?? null,
 				reason: clip(args.reason, 300),
 			})
 			return {
@@ -1633,7 +1636,11 @@ function installAuditTool(service) {
 				if (typeof args.action === 'string' && args.action.length > 0 && entry.action !== args.action) return false
 				return true
 			})
-			return { count: Math.min(filtered.length, limit), entries: filtered.slice(-limit) }
+			// A tool result has to be lossless JSON: a single `undefined` anywhere in an
+			// entry makes the harness reject the WHOLE result. The payloads are fixed at
+			// their source; this boundary is what keeps it that way.
+			const entries = filtered.slice(-limit).map((entry) => JSON.parse(JSON.stringify(entry)))
+			return { count: entries.length, entries }
 		},
 	}))
 }

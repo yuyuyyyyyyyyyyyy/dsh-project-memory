@@ -198,6 +198,32 @@ async function main() {
 	}
 	check('R6 memory_audit refuses to be pointed at another project', auditArgumentError !== undefined, String(auditArgumentError))
 
+	// A correction with NO replacement used to write `replacement_id: undefined`
+	// into the audit entry, and the harness rejects a tool result that is not
+	// lossless JSON — so from that correction on, EVERY memory_audit call failed.
+	let reviseError = undefined
+	try {
+		await b.root.get('tools').get('memory_correct').execute(
+			{ record_id: other.id, status: 'invalidated', reason: 'no replacement' },
+			{ agent: agent(CWD) },
+		)
+	} catch (error) {
+		reviseError = String(error.message)
+	}
+	check('R7 a correction with no replacement is allowed', reviseError === undefined, String(reviseError))
+	const afterRevise = await b.root.get('tools').get('memory_audit').execute({ limit: 200 }, { agent: agent(CWD) })
+	const revised = afterRevise.entries.filter((entry) => entry.action === 'record-revised')
+	check('R8 the revision is audited', revised.length === 1, JSON.stringify(afterRevise.entries.map((entry) => entry.action)))
+	check('R9 a missing replacement is null, never undefined', revised[0] !== undefined && revised[0].replacement_id === null, JSON.stringify(revised[0]))
+	const carriesUndefined = (value) => Array.isArray(value)
+		? value.some(carriesUndefined)
+		: value !== null && typeof value === 'object'
+			? Object.values(value).some(carriesUndefined)
+			: value === undefined
+	check('R10 no audit entry carries an undefined value (the payload must be lossless JSON)',
+		afterRevise.entries.every((entry) => carriesUndefined(entry) === false),
+		JSON.stringify(afterRevise.entries.filter(carriesUndefined)))
+
 	// ── L. lease semantics ─────────────────────────────────────────────────────
 	console.log('\nL. the write lease keeps its promises')
 	let active = 0

@@ -165,7 +165,6 @@ Every key is optional:
 `storeDir` defaults to `$DSH_HOME/storages/dsh_project_memory` — the shell's own
 layout, which the write lease and the record reads depend on. Set it only if the
 storage backend's root is somewhere else.
-```
 
 ## Storage
 
@@ -281,12 +280,36 @@ without the lease, which is how the fix was proven.
 
 ## Status
 
-Offline suites pass against the real DSH modules (78 + 9 + 6 + 10 + 15 checks). On a live
-project the full chain has been observed: a conclusion is produced, recorded
+**Available beta, for low-concurrency personal use.** Offline suites pass against
+the real DSH modules (78 + 23 + 9 + 6 + 10 + 15 = 141 checks). On a live project
+the full chain has been observed: a conclusion is produced, recorded
 **autonomously** (no instruction to remember anything appears in the prompt), the
 record lands in the JSON backend, a later session's first prompt already carries
-it, and a fresh session reuses it. `memory_correct` has unit coverage but has not
-yet been exercised end-to-end on a live record that later proved wrong.
+it, and a fresh session reuses it.
+
+An independent audit then reproduced seven consistency defects against `ba4778a`:
+a deleted record coming back and ghost ids in the index, a lease holder deleting
+its successor's lock, the wait budget breaking mutual exclusion, `memory_correct`
+skipping its ownership check without a cwd, `memory_audit` reading another
+project, an audit action overwritten by its own payload, and a recall budget
+overshoot. All seven are fixed, each pinned by `regression-consistency.test.mjs`,
+and the auditor's own probe and seven assertions pass **unmodified** against the
+fix.
+
+What this is **not**: a strict cross-process consistency guarantee. Coordination
+is best-effort by design (see *Concurrent writers*), and `releaseLease` carries a
+known, unreproduced TOCTOU risk (see *Known limitations*). `memory_correct` has
+unit coverage but has not yet been exercised end-to-end on a live record that
+later proved wrong.
+
+Migrating the lease to the harness's internal `flock` addon — which would give
+handle-owned locks and kernel cleanup of dead holders — is **deliberately not
+done**. It is an internal subpath plus a native module, and it would still leave
+the product decision (wait forever on a live-but-wedged holder, or take over)
+unmade. Revisit it when any of these becomes true: concurrent writes are actually
+observed to lose updates; this package starts promising strict consistency; the
+harness publishes `flock` as a supported interface; or it starts serving several
+long-lived processes at once.
 
 ## Known limitations
 

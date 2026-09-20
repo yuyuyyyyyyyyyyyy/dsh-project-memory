@@ -156,7 +156,7 @@ Every key is optional:
         perRecordChars: 900
         minScore: 3
         auditLimit: 50
-        leaseWaitMs: 4000
+        leaseWaitMs: 15000
         leaseStaleMs: 30000
         storeDir: ''
         debug: false
@@ -238,23 +238,38 @@ on one record, plus an independent verifier):
 | no lease | 41 — one writer's whole lineage, half the updates gone | 3 |
 | with lease | 81 — every update survived | 0 |
 
-The lease is best-effort by construction: a writer that cannot take it within
-`leaseWaitMs` (15 s) takes the file over and proceeds, audited as
-`write-bypass`. A live holder is never robbed — staleness alone is not proof, so
-a lock is only taken over when its pid is gone — but a wedged *live* holder is
-still bypassed after the budget rather than blocking a memory write forever.
-Contention that resolves normally is audited as `write-conflict`.
+The lease is **best-effort coordination, not a mutex**, and the difference is the
+whole story:
+
+- A rival that finishes in time is waited out. That is normal contention and is
+  audited as `write-conflict` (with `waited_ms` and the operation).
+- A lock is only **stolen** when it is older than `leaseStaleMs` *and* its holder's
+  pid is gone. Staleness alone is never proof, so a live-but-slow holder is not
+  robbed for age.
+- The wait is nevertheless bounded by `leaseWaitMs` (15 s default). When the
+  budget expires the writer **takes the file over** — alive holder or not — and
+  proceeds, audited as `write-bypass`. That is deliberate: refusing to store an
+  engineering conclusion because another process is wedged would be worse.
+
+So mutual exclusion holds only *up to* `leaseWaitMs`; after it, two writers can be
+inside at once. Lowering the budget makes that reachable at once — a probe with
+`leaseWaitMs: 120` against a 400 ms hold measures `maxActive: 2` and one
+`write-bypass` — while at the default it takes a holder stuck for 15 s. Treat the
+guarantee as: *no update is computed from a snapshot a completed rival write has
+already superseded*, not as *writers are mutually excluded*.
 
 Two invariants keep the coordination from becoming the failure:
 
 - **A lease that cannot be taken never fails the write.** If the lock cannot be
   created — read-only store, a sandbox that denies it — the write proceeds
   uncoordinated and the degradation is audited once as `write-lease-unavailable`.
-- **The index is unioned with memory, never replaced by the medium.** A store this
-  process cannot see whole must not be able to empty a good index.
+- **The medium is the authority whenever it can be read whole.** A record missing
+  from a readable store is *deleted*, not stale, and a project's index is rebuilt
+  from the medium instead of merged with this process's memory — that merge is
+  exactly what put a deleted record back into the index.
 
 The lock is a file, not a kernel lock: a process killed mid-write leaves it
-behind, so a lease older than `leaseStaleMs` (30 s) is stolen. A transient
+behind, which is why age *plus* a dead pid is what justifies a steal. A transient
 `EPERM`/`EBUSY` from the medium — on Windows, another process simply holding a
 record file open during a rename — is retried instead of surfacing.
 
@@ -293,6 +308,14 @@ yet been exercised end-to-end on a live record that later proved wrong.
   makes concurrent *writes* safe; reads still come from the table the domain
   seeded at open, so a record another process added mid-session is listed in the
   index but resolves to nothing here until this process restarts.
+- **Lease release is not atomic, and that is a real risk rather than a proven
+  defect.** `releaseLease` reads the lock, compares its owner token, and only then
+  removes it. A takeover landing between the read and the removal would make it
+  delete a *successor's* lock and admit a third writer. No probe has reproduced
+  that interleaving and no test covers it, so it is recorded here as a known risk;
+  closing it needs a primitive that owns an open handle (or `flock`) rather than a
+  path. The same is true of the mutual exclusion itself: it holds only up to
+  `leaseWaitMs` — see *Concurrent writers*.
 - **Project identity is the working directory**, so one repository opened from
   two different directories (its root in one session, a subdirectory in another)
   is treated as two projects. Records do not cross that line. Anchor sessions at

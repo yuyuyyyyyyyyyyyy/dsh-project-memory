@@ -137,6 +137,15 @@ async function main() {
 			return false
 		} catch (error) { return String(error.message).includes('owning agent session') }
 	})())
+	const bothInactive = await tool(root, 'memory_record').execute({ problem: 'SYM-1 复现（双选择器保护）', conclusion: 'inferred', root_cause: 'R-BOTH' }, { agent: { session } })
+	await tool(root, 'memory_correct').execute({ record_id: bothInactive.record_id, status: 'invalidated', reason: 'R' }, { agent: { session } })
+	check('4d giving both selectors is refused', await (async () => {
+		try {
+			await tool(root, 'memory_forget').execute({ record_id: keeper.record_id, only_inactive: true }, { agent: { session } })
+			return false
+		} catch (error) { return String(error.message).includes('exactly one selector') }
+	})())
+	check('4e a refused ambiguous request deletes nothing', memory.get(bothInactive.record_id) !== undefined)
 
 	console.log('\n' + (failures === 0 ? 'ALL ' + checks + ' CHECKS PASSED' : failures + ' of ' + checks + ' CHECKS FAILED'))
 	process.exit(failures === 0 ? 0 : 1)

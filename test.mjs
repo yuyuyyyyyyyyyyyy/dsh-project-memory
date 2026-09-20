@@ -186,7 +186,7 @@ async function main() {
 	}
 	const systemPrompt = root.get('systemPrompt')
 	const tools = root.get('tools')
-	check('M2 all four tools registered into the host registry', ['memory_search', 'memory_record', 'memory_correct', 'memory_audit'].every((name) => tools.get(name) !== undefined))
+	check('M2 all five tools registered into the host registry', ['memory_search', 'memory_record', 'memory_correct', 'memory_forget', 'memory_audit'].every((name) => tools.get(name) !== undefined))
 
 	const subject = 'SYM-1 的故障复现了'
 	const sessionA1 = fakeSession('session-a1', PROJECT_A, ['SYM-1 的故障复现了'])

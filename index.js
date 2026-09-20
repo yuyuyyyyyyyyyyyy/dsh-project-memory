@@ -1562,8 +1562,9 @@ function installForgetTool(service) {
 			const session = service.sessionOf(exec)
 			const project = projectIdOf(session.header?.cwd)
 			if (project === undefined) throw new Error('memory_forget requires a session whose header carries a cwd')
+			const hasRecord = typeof args.record_id === 'string' && args.record_id.length > 0
 			const wantsPurge = args.only_inactive === true
-			if (!wantsPurge && (typeof args.record_id !== 'string' || args.record_id.length === 0)) {
+			if (hasRecord === wantsPurge) {
 				throw new Error('memory_forget: give exactly one selector — record_id, or only_inactive: true')
 			}
 			const forgotten = []

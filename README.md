@@ -26,6 +26,7 @@ package is patched, no shipped preset is copied or edited.
 | `memory_search` | `ctx.tools.register()` | Explicit lookup by file, symbol, error text, symptom, feature |
 | `memory_record` | `ctx.tools.register()` | Write one structured conclusion |
 | `memory_correct` | `ctx.tools.register()` | Mark an earlier conclusion `superseded` / `corrected` / `invalidated` / `confirmed`, optionally linking a replacement |
+| `memory_forget` | `ctx.tools.register()` | Delete one record, or a bounded batch of inactive records, with project checks |
 | `memory_audit` | `ctx.tools.register()` | Read back what was recalled, why, and what lost |
 
 ## Record schema
@@ -194,11 +195,15 @@ system-prompt registry. Only the storage medium is faked
 ```sh
 # the dependency mirror inside the installed harness
 export DSH_PLUGIN_DEPS="$DSH_HOME/profiles/node_modules"
-node --import ./register-deps.mjs test.mjs                   # 78 checks
-node --import ./register-deps.mjs lease.test.mjs             # 9 checks, 3 processes
-node --import ./register-deps.mjs loader.test.mjs            # 6 checks
-node --import ./register-deps.mjs regression.test.mjs        # 10 checks
-node --import ./register-deps.mjs regression-forget.test.mjs # 15 checks
+node --import ./register-deps.mjs test.mjs                        # 78 checks
+node --import ./register-deps.mjs regression-consistency.test.mjs # 27 checks
+node --import ./register-deps.mjs lease.test.mjs                  # 9 checks, 3 processes
+node --import ./register-deps.mjs loader.test.mjs                 # 6 checks
+node --import ./register-deps.mjs regression.test.mjs             # 10 checks
+node --import ./register-deps.mjs regression-forget.test.mjs      # 17 checks
+
+# Or run all six suites through the package entry point:
+npm test
 ```
 
 `test.mjs` covers: first encounter with no history, write (including rejection of
@@ -227,7 +232,7 @@ Before each mutation the plugin takes
 filesystem admits exactly one holder. Inside that hold it re-reads the record
 **document** instead of trusting its own in-memory copy, bumps that revision, and
 writes. The lock file names its holder, so a rival process can see who is writing
-which record, and `memory_audit` logs `write-waited` / `write-conflict`.
+which record, and `memory_audit` logs `write-conflict` / `write-bypass`.
 
 Measured with three OS processes (`lease.test.mjs`: two writers, 40 updates each
 on one record, plus an independent verifier):
@@ -281,7 +286,7 @@ without the lease, which is how the fix was proven.
 ## Status
 
 **Available beta, for low-concurrency personal use.** Offline suites pass against
-the real DSH modules (78 + 27 + 9 + 6 + 10 + 15 = 145 checks). On a live project
+the real DSH modules (78 + 27 + 9 + 6 + 10 + 17 = 147 checks). On a live project
 the full chain has been observed: a conclusion is produced, recorded
 **autonomously** (no instruction to remember anything appears in the prompt), the
 record lands in the JSON backend, a later session's first prompt already carries

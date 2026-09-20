@@ -139,7 +139,7 @@ async function main() {
 		}
 	} else {
 		const tools = root.get('tools')
-		check('L2 the four tools registered', ['memory_search', 'memory_record', 'memory_correct', 'memory_audit'].every((name) => tools.get(name) !== undefined))
+		check('L2 the five tools registered', ['memory_search', 'memory_record', 'memory_correct', 'memory_forget', 'memory_audit'].every((name) => tools.get(name) !== undefined))
 		const session = { id: 'loader-test', header: { cwd: 'C:\\work\\loader-test' }, deriveMessages: () => [{ role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'SYM-1 复现' }] }], snapshotEvents: () => [] }
 		const created = await tools.get('memory_record').execute({
 			problem: 'SYM-1 复现',

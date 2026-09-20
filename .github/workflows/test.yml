@@ -1,0 +1,29 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install the verified Harness build
+        run: npm install --no-save @deepseek-ai/dsh@0.1.5-rc.2
+      - name: Run all plugin suites
+        run: npm test
+        env:
+          DSH_PLUGIN_DEPS: ${{ github.workspace }}/node_modules
+      - name: Verify the published file set
+        run: npm run pack:check

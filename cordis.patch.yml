@@ -1,0 +1,19 @@
+# Example: how to mount Project Memory from a profile's user patch layer.
+# Append this to $DSH_HOME/profiles/<your-profile>/cordis.patch.yml and restart dsh.
+#
+# It is HOST-PLANE on purpose: the records back every session of a project, so a
+# preset realm (an entry-local instance per session) would give each session its
+# own copy and defeat the feature.
+#
+# The row name is a LITERAL absolute path, never a `!!js` expression. This layer
+# is anchored by `anchorInsertedPluginNames`, which only rewrites a `name` it can
+# prove is a string; a `!!js` scalar arrives as a `{__jsExpr}` object, skips that
+# rewrite, and reaches the Loader's import as an object — booting then fails with
+# `name.startsWith is not a function`. (`!!js` is for `config` values, which the
+# Loader interpolates per entry; a row's `name` is consumed to resolve the module
+# before any such interpolation.)
+#
+# Replace the path below with the absolute location of index.js on YOUR machine.
+- insert:
+    - id: project-memory
+      name: 'REPLACE/WITH/YOUR/DSH_HOME/profiles/dsh-project-memory/index.js'

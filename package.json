@@ -1,0 +1,11 @@
+{
+  "name": "dsh-project-memory",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Cross-session project engineering memory for DSH coding agents: durable per-project records of problems, failed attempts, verified root causes and constraints, recalled automatically before the agent plans.",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js"
+  }
+}

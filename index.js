@@ -758,6 +758,25 @@ class ProjectMemory extends Service {
 	}
 
 	/**
+	 * Drop one record from the store.
+	 *
+	 * Records accumulate — superseded conclusions, duplicates, entries whose
+	 * subject moved on — and there was no way to remove one, so the store could
+	 * only grow. The caller owns the authorization decision (see the tool's
+	 * project check); this method only performs the removal and keeps the
+	 * project's index consistent with the table.
+	 * @param recordId - the record to drop.
+	 * @returns the dropped record, or undefined when no such record exists.
+	 */
+	async forget(recordId) {
+		const record = this.requireTable().get(recordId)
+		if (record === undefined) return undefined
+		await this.requireTable().delete(recordId)
+		await this.reindex(record.project)
+		return record
+	}
+
+	/**
 	 * Rewrite one project's id index to match the table, newest first.
 	 * @param project - the project key.
 	 */
@@ -774,6 +793,7 @@ class ProjectMemory extends Service {
 		installSearchTool(this)
 		installRecordTool(this)
 		installCorrectTool(this)
+		installForgetTool(this)
 		installAuditTool(this)
 	}
 
@@ -1136,12 +1156,77 @@ function installCorrectTool(service) {
 	}))
 }
 
+/** Register `memory_forget`. */
+function installForgetTool(service) {
+	service.ctx.tools.register(defineTool({
+		name: 'memory_forget',
+		description: [
+			'Drop records from this project\'s memory. Records otherwise accumulate forever: superseded conclusions, duplicates, and entries whose subject has moved on.',
+			'Give exactly one selector: `record_id` to drop one record, or `only_inactive: true` to drop this project\'s superseded/invalidated records.',
+			'A purge is BOUNDED (50 per call) and can never touch an active or confirmed conclusion, because those are what later sessions still consult.',
+			'Prefer `memory_correct` over deleting: a revision keeps the history of why a conclusion changed, while a deleted record leaves no trace of the mistake.',
+		].join(' '),
+		parameters: {
+			record_id: { type: 'string', description: 'Exact record id to drop. Requires authorization by the project that owns it.' },
+			only_inactive: { type: 'boolean', description: 'Drop this project\'s superseded and invalidated records, up to the purge limit per call.' },
+		},
+		output: {
+			schema: {
+				type: 'object',
+				additionalProperties: false,
+				properties: {
+					forgotten: { type: 'array', required: true, items: { type: 'string' } },
+					remaining_inactive: { type: 'integer', required: true },
+				},
+			},
+			render: (_args, value) => [{
+				type: 'text',
+				text: value.forgotten.length === 0
+					? 'Nothing forgotten; no inactive records matched.'
+					: 'Forgot ' + value.forgotten.length + ' record(s)' + (value.remaining_inactive > 0 ? '; ' + value.remaining_inactive + ' inactive record(s) still remain (the purge is bounded per call).' : '.'),
+			}],
+		},
+		async execute(args, exec) {
+			const session = service.sessionOf(exec)
+			const project = projectIdOf(session.header?.cwd)
+			if (project === undefined) throw new Error('memory_forget requires a session whose header carries a cwd')
+			const wantsPurge = args.only_inactive === true
+			if (!wantsPurge && (typeof args.record_id !== 'string' || args.record_id.length === 0)) {
+				throw new Error('memory_forget: give exactly one selector — record_id, or only_inactive: true')
+			}
+			const forgotten = []
+			if (!wantsPurge) {
+				const existing = service.get(args.record_id)
+				if (existing === undefined) throw new Error('memory_forget: no record "' + args.record_id + '"')
+				if (existing.project !== project) {
+					throw new Error('memory_forget: record "' + args.record_id + '" belongs to another project (' + existing.project + ')')
+				}
+				const dropped = await service.forget(args.record_id)
+				if (dropped !== undefined) forgotten.push(dropped.id)
+			} else {
+				// Bounded on purpose: a purge that emptied the project's whole inactive
+				// history in one call would be indistinguishable from an accident.
+				for (const record of service.allForProject(project)) {
+					if (forgotten.length >= 50) break
+					if (record.status !== 'superseded' && record.status !== 'invalidated') continue
+					const dropped = await service.forget(record.id)
+					if (dropped !== undefined) forgotten.push(dropped.id)
+				}
+			}
+			const remaining = service.allForProject(project).filter((record) => record.status === 'superseded' || record.status === 'invalidated').length
+			service.recallHook('record-forgotten', { project, records: forgotten, remaining_inactive: remaining, mode: wantsPurge ? 'purge-inactive' : 'single' })
+			return { forgotten, remaining_inactive: remaining }
+		},
+		presentCall: (args) => ({ card: 'generic', title: 'Forget project memory', kind: 'other', rawInput: args }),
+	}))
+}
+
 /** Register `memory_audit`. */
 function installAuditTool(service) {
 	service.ctx.tools.register(defineTool({
 		name: 'memory_audit',
 		description: [
-			'Read this process\'s project-memory audit trail: every recall (which records were injected, why each was considered relevant, and how many candidates lost), every write, and every revision.',
+			'Read this process\'s project-memory audit trail: every recall (which records were injected, why each was considered relevant, and how many candidates lost), every write, every revision, and every forgotten record.',
 			'Use it to check what history an earlier step actually saw, or to explain why something was or was not recalled.',
 		].join(' '),
 		parameters: {

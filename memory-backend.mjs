@@ -31,22 +31,6 @@ const BACKEND_NAME = 'memory'
  */
 const medium = { units: new Map(), open: new Set() }
 
-/**
- * Swap the medium this backend opens units from.
- *
- * A durable backend reads whatever its root directory holds when it starts; a
- * test that needs "a fresh process over the same storage" swaps in the previous
- * medium here, which is the in-memory equivalent of pointing a new process at
- * the same directory.
- * @param units - the medium to serve from now on.
- * @returns the medium that was previously served.
- */
-function useMedium(units) {
-	const previous = medium.units
-	medium.units = units
-	return previous
-}
-
 /** Deep-clone through JSON: the durable boundary stores plain data only. */
 function clone(value) {
 	return JSON.parse(JSON.stringify(value))
@@ -113,4 +97,4 @@ function apply(ctx) {
 	ctx.storage.backend.register(BACKEND_NAME, backend)
 }
 
-export { BACKEND_NAME, SERVICE_KEY, apply, backend, inject, medium, name, useMedium }
+export { BACKEND_NAME, SERVICE_KEY, apply, backend, inject, medium, name }

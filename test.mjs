@@ -21,7 +21,7 @@ import { pathToFileURL } from 'node:url'
 import { Context } from '@deepseek-ai/cordis'
 import Loader, { EntryGroup } from '@deepseek-ai/cordis-plugin-loader'
 import { Include } from '@deepseek-ai/cordis-plugin-include'
-import { medium, useMedium } from './memory-backend.mjs'
+import { medium } from './memory-backend.mjs'
 
 const PLUGIN = new URL('./index.js', import.meta.url).href
 /** Bare `@deepseek-ai/*` names in this composition resolve from the installed harness. */
@@ -400,8 +400,8 @@ async function main() {
 		check('G3 recall does not return the whole history', result.records.length < total, result.records.length + ' of ' + total)
 		check('G4 every recalled record is one of the relevant ones', result.records.every((entry) => entry.record.tags.includes('tag-one')), JSON.stringify(result.records.map((entry) => entry.record.tags)))
 		check('G5 the injected text stays bounded', text.length <= 2600, String(text.length))
-		check('G6 the injected text excludes unrelated records', !text.includes('UNRELATED-'))
-		check('G7 an unrelated task recalls no unrelated record', memory.recall(sessionA3).records.every((entry) => !entry.record.tags.includes('unrelated')))
+		check('G6 the injected text excludes the bulk noise', !text.includes('NOTE-'))
+		check('G7 an unrelated task recalls no bulk record', memory.recall(sessionA3).records.every((entry) => !entry.record.tags.includes('unrelated')))
 	}
 
 	// ── H. transparency ────────────────────────────────────────────────────────

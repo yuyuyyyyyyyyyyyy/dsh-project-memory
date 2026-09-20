@@ -68,6 +68,18 @@ function compareNames(a, b) {
 	return a < b ? -1 : a > b ? 1 : 0
 }
 
+/**
+ * Order record ids newest first, so recall's recency weighting is stable
+ * wherever an id list is produced. A shared helper on purpose: two spellings of
+ * this order would let a rebuilt index and a read path disagree.
+ * @param ids - record ids to order.
+ * @param table - the records table the ids belong to.
+ * @returns a new, ordered array.
+ */
+function sortIdsNewestFirst(ids, table) {
+	return [...ids].sort((left, right) => (table.get(right)?.created_at ?? 0) - (table.get(left)?.created_at ?? 0) || compareNames(left, right))
+}
+
 /** Collapse runs of whitespace so prose fields stay one line and bounded. */
 function squeeze(text) {
 	return String(text).replace(/\s+/g, ' ').trim()
@@ -503,9 +515,12 @@ class ProjectMemory extends Service {
 	}
 
 	/**
-	 * Rebuild the per-project id index from the records table, so a lost index
-	 * self-heals. The rebuild is written back when it disagrees with what is
-	 * stored, which is the durable half of that guarantee.
+	 * Rebuild the per-project id index from the records table.
+	 *
+	 * The comparison is by IDENTITY, not by count: an index of the right length
+	 * holding a wrong id is exactly as broken as a short one, and a length check
+	 * would leave it in place. The index is a rebuildable convenience, so any
+	 * disagreement with the records table is repaired on open.
 	 * @returns the rebuilt grouping.
 	 */
 	async rebuildIndex() {
@@ -516,7 +531,12 @@ class ProjectMemory extends Service {
 			grouped.set(record.project, ids)
 		}
 		for (const [project, ids] of grouped) {
-			if (this.indexTable.get(project)?.ids.length !== ids.length) await this.indexTable.put(project, { ids })
+			const sorted = sortIdsNewestFirst(ids, this.requireTable())
+			const stored = this.indexTable.get(project)?.ids
+			const matches = stored !== undefined
+				&& stored.length === sorted.length
+				&& stored.every((id, position) => id === sorted[position])
+			if (!matches) await this.indexTable.put(project, { ids: sorted })
 		}
 		return grouped
 	}
@@ -533,8 +553,7 @@ class ProjectMemory extends Service {
 	idsForProject(project) {
 		const entry = this.indexTable.get(project)
 		if (entry === undefined) return []
-		const table = this.requireTable()
-		return [...entry.ids].sort((left, right) => (table.get(right)?.created_at ?? 0) - (table.get(left)?.created_at ?? 0) || compareNames(left, right))
+		return sortIdsNewestFirst([...entry.ids], this.requireTable())
 	}
 
 	/**
@@ -1020,7 +1039,7 @@ function installCorrectTool(service) {
 		description: [
 			'Revise an existing project-memory record when new evidence changes what is true.',
 			'Use it instead of silently recording a contradicting conclusion: the old record is marked `superseded`, `corrected`, `invalidated`, or `confirmed`, so two incompatible conclusions never carry equal weight in a later session.',
-			'Omit `new_problem` when no replacement record is needed (pure confirmation or invalidation); supply it to write the replacement, which is linked in both directions.',
+			'Supply `new_problem` to write the replacement record, linked in both directions — it is REQUIRED for "superseded" and "corrected", because those statuses mean the conclusion is being replaced. Omit it only for "invalidated" (rejected outright) or "confirmed" (still holds).',
 		].join(' '),
 		parameters: {
 			record_id: { type: 'string', required: true, description: 'The record being revised.' },
@@ -1031,7 +1050,7 @@ function installCorrectTool(service) {
 				description: 'How the old conclusion now stands.',
 			},
 			reason: { type: 'string', required: true, description: 'The evidence that changed the conclusion.' },
-			new_problem: { type: 'string', description: 'Problem text of the replacement record. Omit to only revise the old one.' },
+			new_problem: { type: 'string', description: 'Problem text of the replacement record. Required for "superseded" and "corrected"; omit only for "invalidated" or "confirmed".' },
 			new_root_cause: { type: 'string', description: 'The replacement conclusion.' },
 			new_verification: { type: 'string', description: 'The reproduction that backs the replacement.' },
 			new_facts: { type: 'array', items: { type: 'string' }, description: 'Newly observed evidence statements.' },
@@ -1064,18 +1083,26 @@ function installCorrectTool(service) {
 			const project = projectIdOf(cwd)
 			const existing = service.get(args.record_id)
 			if (existing === undefined) throw new Error('memory_correct: no record "' + args.record_id + '"')
+			const replacementProblem = squeeze(args.new_problem ?? '')
+			// A conclusion is only "corrected" or "superseded" IN FAVOUR of a
+			// replacement record. Without one, the old text would stay the only
+			// account while recall's filter let a "corrected" record through, so
+			// the correction would never reach a later session.
+			if ((args.status === 'superseded' || args.status === 'corrected') && replacementProblem.length === 0) {
+				throw new Error('memory_correct: status "' + args.status + '" requires a replacement — supply new_problem (with new_root_cause, and new_verification to record it as verified). Use "invalidated" to reject a conclusion outright, or "confirmed" to affirm it.')
+			}
 			if (project !== undefined && existing.project !== project) {
 				throw new Error('memory_correct: record "' + args.record_id + '" belongs to another project (' + existing.project + ')')
 			}
 			let replacement
-			if (squeeze(args.new_problem ?? '').length > 0) {
+			if (replacementProblem.length > 0) {
 				const relatedFiles = service.stringList(args.related_files)
 				const relatedSymbols = service.stringList(args.related_symbols)
 				const tags = service.stringList(args.tags)
 				replacement = await service.put({
 					project: existing.project,
 					project_path: existing.project_path,
-					problem: squeeze(args.new_problem).slice(0, 400),
+					problem: replacementProblem.slice(0, 400),
 					symptoms: existing.symptoms,
 					facts: service.stringList(args.new_facts).map((statement) => ({ statement, source: clip(args.reason, 200) })),
 					hypotheses: [],

@@ -171,14 +171,25 @@ system-prompt registry. Only the storage medium is faked
 ```sh
 # the dependency mirror inside the installed harness
 export DSH_PLUGIN_DEPS="$DSH_HOME/profiles/node_modules"
-node --import ./register-deps.mjs test.mjs     # 74 checks
-node --import ./register-deps.mjs loader.test.mjs   # 6 checks
+node --import ./register-deps.mjs test.mjs          # 74 checks
+node --import ./register-deps.mjs loader.test.mjs    # 6 checks
+node --import ./register-deps.mjs regression.test.mjs # 10 checks
 ```
 
 `test.mjs` covers: first encounter with no history, write (including rejection of
 an unproven `verified`), cross-session recall, failed-plan prohibition, correction
 and supersession, project isolation, bounded recall over 40+ records, audit
 filtering, and reload over the same medium.
+
+`regression.test.mjs` pins two defects that shipped once and are easy to
+reintroduce:
+
+- an index of the right LENGTH but wrong CONTENT (an id that matches no record)
+  is repaired on open — a length comparison alone left it in place;
+- `memory_correct(status: "corrected")` with no replacement is refused, because
+  recall filters superseded/invalidated records while a correction is only
+  meaningful in favour of a replacement — without one the stale text would keep
+  reaching later sessions.
 
 ## Status
 
@@ -199,11 +210,16 @@ yet been exercised end-to-end on a live record that later proved wrong.
   bigram can score ≈ 0.2, clear the floor, and (if `minScore` is met) be
   recalled. Lower `maxRecallRecords` or raise `minScore` when this matters.
 - **No persisted inverted index** — the candidate set is scored per recall from
-  the in-memory domain table. Fine at hundreds of records; not measured at tens
-  of thousands.
+  the in-memory domain table; the per-project id index is a rebuildable
+  convenience repaired from the records table on open. Fine at hundreds of
+  records; not measured at tens of thousands.
 - **Precision is preferred over recall.** `minScore` (default 3) drops weak
   candidates silently; a marginal record can miss injection at score ≈ 4.
 - **The audit trail is in-memory** — bounded, lost on restart.
+- **Project identity is the working directory**, so one repository opened from
+  two different directories (its root in one session, a subdirectory in another)
+  is treated as two projects. Records do not cross that line. Anchor sessions at
+  the repository root, or the memory will look empty from the other directory.
 - **Recording depends on the model following the contract.** The contract text
   is deliberately prescriptive: a purely permissive wording produced zero writes
   in testing.

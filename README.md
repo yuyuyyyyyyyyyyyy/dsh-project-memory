@@ -347,6 +347,13 @@ long-lived processes at once.
   two different directories (its root in one session, a subdirectory in another)
   is treated as two projects. Records do not cross that line. Anchor sessions at
   the repository root, or the memory will look empty from the other directory.
+- **One working directory is one pool.** Several subsystems developed under the
+  same root — say `job_agent_mvp/`, `_site/v3/`, and a plugin in a sibling
+  directory you also open here — share one record set and one recall ranking;
+  recall does not separate them by path or subsystem. A record's `related_files`
+  carries the path, but nothing requires an overlap before a record is injected.
+  This is a known boundary, not a bug: splitting the pool would change how recall
+  ranks, and that needs real-sample comparison before it is designed.
 - **Recording depends on the model following the contract.** The contract text
   is deliberately prescriptive: a purely permissive wording produced zero writes
   in testing.

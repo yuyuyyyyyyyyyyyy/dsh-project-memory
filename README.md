@@ -171,8 +171,8 @@ system-prompt registry. Only the storage medium is faked
 ```sh
 # the dependency mirror inside the installed harness
 export DSH_PLUGIN_DEPS="$DSH_HOME/profiles/node_modules"
-node --import ./register-deps.mjs test.mjs      # 74 checks
-node --import ./register-deps.mjs loader.test.mjs
+node --import ./register-deps.mjs test.mjs     # 74 checks
+node --import ./register-deps.mjs loader.test.mjs   # 6 checks
 ```
 
 `test.mjs` covers: first encounter with no history, write (including rejection of

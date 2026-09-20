@@ -136,15 +136,16 @@ Learned by hitting them; they are also in the memory this plugin manages.
    process.** Modules are cached by URL: touching the composition, the mount
    stamp changing, and even pointing the preset at a freshly named file all keep
    serving the module the process first imported. Restart `dsh`.
-3. **Never run two `dsh` processes against the same `$DSH_HOME`.** Session logs
-   are single-writer; the second instance cannot resume anything the first still
-   holds and fails with `SessionAlreadyOwnedError (gateway/internal)`.
+3. **Two `dsh` processes on one `$DSH_HOME` cannot share a session.** Session
+   artifacts are single-writer per session: the second instance fails with
+   `SessionAlreadyOwnedError (gateway/internal)` when it opens a session the first
+   one holds. Separate sessions do run side by side — see *Concurrent writers* for
+   what that costs the memory store.
 
 ## Configuration
 
 Every key is optional:
 
-```yaml
 ```yaml
 - insert:
     - id: project-memory
@@ -237,6 +238,13 @@ on one record, plus an independent verifier):
 | no lease | 41 — one writer's whole lineage, half the updates gone | 3 |
 | with lease | 81 — every update survived | 0 |
 
+The lease is best-effort by construction: a writer that cannot take it within
+`leaseWaitMs` (15 s) takes the file over and proceeds, audited as
+`write-bypass`. A live holder is never robbed — staleness alone is not proof, so
+a lock is only taken over when its pid is gone — but a wedged *live* holder is
+still bypassed after the budget rather than blocking a memory write forever.
+Contention that resolves normally is audited as `write-conflict`.
+
 Two invariants keep the coordination from becoming the failure:
 
 - **A lease that cannot be taken never fails the write.** If the lock cannot be
@@ -292,6 +300,15 @@ yet been exercised end-to-end on a live record that later proved wrong.
 - **Recording depends on the model following the contract.** The contract text
   is deliberately prescriptive: a purely permissive wording produced zero writes
   in testing.
+
+## Compatibility
+
+Verified against DeepSeek Harness `0.1.5-rc.2` (Node 24) on 2026-09-20. The
+harness is a developer preview and says outright that it will make
+compatibility-breaking changes; a green run here is evidence about this build,
+not a promise about the next one. The plugin depends only on the `tools`,
+`storageDomain` and `systemPrompt` services and on `dsh.bundle.patch`, which is
+the narrowest surface it could use.
 
 ## License
 

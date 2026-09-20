@@ -412,7 +412,7 @@ async function main() {
 	console.log('\nH. the recall decision is auditable')
 	{
 		const auditTool = tool(root, 'memory_audit')
-		const audit = await auditTool.execute({ limit: 200 })
+		const audit = await auditTool.execute({ limit: 200 }, { agent: fakeAgent(sessionA2) })
 		const injected = audit.entries.filter((entry) => entry.action === 'recall-injected')
 		check('H1 recall injections are audited', injected.length > 0)
 		check('H2 the audit names the records that were injected', injected[0].records.length > 0)
@@ -422,8 +422,8 @@ async function main() {
 		check('H6 the audit records the injected size', typeof injected[0].injected_chars === 'number')
 		check('H7 writes are audited', audit.entries.some((entry) => entry.action === 'record-created'))
 		check('H8 revisions are audited', audit.entries.some((entry) => entry.action === 'record-revised'))
-		check('H9 the audit is filterable by action', (await auditTool.execute({ action: 'record-created', limit: 200 })).entries.every((entry) => entry.action === 'record-created'))
-		check('H10 the audit is filterable by project', (await auditTool.execute({ project: created.project, limit: 200 })).entries.every((entry) => entry.project === created.project))
+		check('H9 the audit is filterable by action', (await auditTool.execute({ action: 'record-created', limit: 200 }, { agent: fakeAgent(sessionA2) })).entries.every((entry) => entry.action === 'record-created'))
+		check('H10 the audit is filterable by project', (await auditTool.execute({ project: created.project, limit: 200 }, { agent: fakeAgent(sessionA2) })).entries.every((entry) => entry.project === created.project))
 	}
 
 	// ── I. restart over the same medium ────────────────────────────────────────
@@ -475,7 +475,7 @@ async function main() {
 			check('J2 a write still succeeds when no lease can be taken', typeof first.record_id === 'string', JSON.stringify(first))
 			const second = await tool(degraded, 'memory_record').execute({ problem: 'LEASE-UNAVAILABLE-2', conclusion: 'inferred' }, { agent: fakeAgent(session) })
 			check('J3 the next write succeeds too', typeof second.record_id === 'string')
-			const audit = await tool(degraded, 'memory_audit').execute({ limit: 200 })
+			const audit = await tool(degraded, 'memory_audit').execute({ limit: 200 }, { agent: fakeAgent(session) })
 			const unavailable = audit.entries.filter((entry) => entry.action === 'write-lease-unavailable')
 			check('J4 the degradation is reported exactly once', unavailable.length === 1, String(unavailable.length))
 		}

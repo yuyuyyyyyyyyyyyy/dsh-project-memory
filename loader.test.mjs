@@ -125,7 +125,7 @@ async function main() {
 		'- id: storage-domain', "  name: '@deepseek-ai/dsh-storage-domain'", '  config:', '    backend: memory',
 		'- id: tools', "  name: '@deepseek-ai/dsh-tools'",
 		'- id: system-prompt', "  name: '@deepseek-ai/dsh-system-prompt'",
-		'- id: project-memory', '  name: ' + JSON.stringify(PLUGIN),
+		'- id: project-memory', '  name: ' + JSON.stringify(PLUGIN), '  config:', '    storeDir: ' + JSON.stringify(dir),
 		'',
 	].join('\n'))
 	await loader.create({ id: 'root', name: 'cordis:include', config: { path: pathToFileURL(file).href } })

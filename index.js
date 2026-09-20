@@ -20,8 +20,8 @@
  * @module dsh-project-memory
  */
 
-import { createHash } from 'node:crypto'
-import { mkdir, open, readFile, readdir, rm, stat } from 'node:fs/promises'
+import { createHash, randomUUID } from 'node:crypto'
+import { mkdir, open, readFile, readdir, rename, rm, stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { Service } from '@deepseek-ai/cordis'
@@ -128,7 +128,9 @@ async function acquireLease(dir, key, holder, waitMs, staleMs) {
 		return { path: undefined, waited: 0, unavailable: true }
 	}
 	const path = join(dir, key + LEASE_SUFFIX)
-	const body = JSON.stringify(holder) + '\n'
+	const token = randomUUID()
+	const body = JSON.stringify({ ...holder, token }) + '\n'
+	let deadlinePassed = false
 	// Measured from the FIRST refusal, not from entry: taking an uncontended lease
 	// costs a write and an fsync, and counting that as "waited for a rival" would
 	// report contention on every single write.
@@ -142,25 +144,97 @@ async function acquireLease(dir, key, holder, waitMs, staleMs) {
 			} finally {
 				await handle.close()
 			}
-			return { path, waited: contendedAt === undefined ? 0 : Date.now() - contendedAt }
+			return { path, token, waited: contendedAt === undefined ? 0 : Date.now() - contendedAt, bypassed: deadlinePassed }
 		} catch (error) {
 			if (error?.code !== 'EEXIST') return { path: undefined, waited: 0, unavailable: true }
 			contendedAt ??= Date.now()
-			const info = await stat(path).catch(() => undefined)
-			if (info !== undefined && Date.now() - info.mtimeMs > staleMs) {
-				await rm(path, { force: true }).catch(() => {})
-				continue
-			}
+			if (await leaseAbandoned(path, staleMs) && await stealLease(path)) continue
 			const waited = Date.now() - contendedAt
-			if (waited >= waitMs) return { path, waited, timedOut: true }
+			if (waited >= waitMs) {
+				// Best-effort exclusivity has a deadline. Taking over the file — rather
+				// than writing with no lease at all — keeps the invariant that the lock
+				// on disk belongs to whoever is writing now.
+				if (await stealLease(path)) {
+					deadlinePassed = true
+					continue
+				}
+				return { path: undefined, waited, unavailable: true }
+			}
 			await delay(LEASE_POLL_MS)
 		}
 	}
 }
 
-/** Release one held lease. A writer that never took the lease has nothing to release. */
+/** One lease file's content, or undefined when it is missing or unreadable. */
+async function readLease(path) {
+	try {
+		const parsed = JSON.parse(await readFile(path, 'utf8'))
+		return parsed !== null && typeof parsed === 'object' ? parsed : undefined
+	} catch {
+		return undefined
+	}
+}
+
+/** Whether a process id still exists. Lease directories are local, so ids are meaningful. */
+function processAlive(pid) {
+	if (typeof pid !== 'number' || Number.isInteger(pid) === false || pid <= 0) return false
+	try {
+		process.kill(pid, 0)
+		return true
+	} catch (error) {
+		return error?.code === 'EPERM'
+	}
+}
+
+/**
+ * Whether a lease may be taken from its holder.
+ *
+ * Age alone cannot prove the holder is gone, and robbing a live process that is
+ * merely slow is worse than waiting: staleness only opens the question, and a pid
+ * that still exists answers it with "no".
+ * @param path - the lock file.
+ * @param staleMs - age after which a lease is a candidate for takeover.
+ * @returns whether the lease looks abandoned.
+ */
+async function leaseAbandoned(path, staleMs) {
+	const info = await stat(path).catch(() => undefined)
+	if (info === undefined) return true
+	if (Date.now() - info.mtimeMs <= staleMs) return false
+	const holder = await readLease(path)
+	return holder === undefined || processAlive(holder.pid) === false
+}
+
+/**
+ * Take a lease file away from its holder, atomically.
+ *
+ * `rename` is what makes this safe: exactly one racer can move a given path, so
+ * a stale lease is never stolen twice and the previous holder's later release
+ * cannot reach the file a successor now owns.
+ * @param path - the lock file.
+ * @returns whether this caller won the move.
+ */
+async function stealLease(path) {
+	const aside = path + '.abandoned.' + randomUUID()
+	try {
+		await rename(path, aside)
+	} catch {
+		return false
+	}
+	await rm(aside, { force: true }).catch(() => {})
+	return true
+}
+
+/**
+ * Release one held lease — and only while it is still OURS.
+ *
+ * A writer whose lease expired and was taken over owns nothing any more, and
+ * removing the successor's file would let a third writer straight in.
+ * @param held - the lease returned by `acquireLease`.
+ */
 async function releaseLease(held) {
-	if (held === undefined || held.timedOut === true || held.path === undefined) return
+	if (held === undefined || held.timedOut === true || held.path === undefined || held.token === undefined) return
+	const holder = await readLease(held.path)
+	if (holder !== undefined && holder.token !== held.token) return
 	await rm(held.path, { force: true }).catch(() => {})
 }
 
@@ -569,7 +643,7 @@ const Config = z.object({
 	perRecordChars: z.natural().min(200).default(900),
 	minScore: z.number().default(3),
 	auditLimit: z.natural().min(1).default(50),
-	leaseWaitMs: z.natural().default(4000),
+	leaseWaitMs: z.natural().default(15000),
 	leaseStaleMs: z.natural().default(30000),
 	storeDir: z.string().default(''),
 })
@@ -666,11 +740,11 @@ class ProjectMemory extends Service {
 				this.recallHook('write-lease-unavailable', { project, lease_dir: this.leaseDir })
 				this.ctx.logger.warn('project memory: cannot create a write lease in ' + this.leaseDir + '; writes are uncoordinated across processes')
 			}
-		} else if (held.timedOut) {
-			this.recallHook('write-conflict', { ...holder, waited_ms: held.waited })
-			this.ctx.logger.warn('project memory: another process held the write lease for "' + project + '" for ' + held.waited + 'ms; writing without it')
+		} else if (held.bypassed === true) {
+			this.recallHook('write-bypass', { ...holder, waited_ms: held.waited })
+			this.ctx.logger.warn('project memory: another process held the write lease for "' + project + '" for ' + held.waited + 'ms; taking it over')
 		} else if (held.waited > 0) {
-			this.recallHook('write-waited', { ...holder, waited_ms: held.waited })
+			this.recallHook('write-conflict', { ...holder, waited_ms: held.waited })
 		}
 		try {
 			return await operation()
@@ -742,11 +816,29 @@ class ProjectMemory extends Service {
 	 */
 	async resolveRecord(recordId) {
 		const local = this.requireTable().get(recordId)
-		if (local !== undefined) return local
 		const stored = await this.readStoredRecord(recordId)
-		if (stored === undefined) return undefined
-		await writeWithRetry(() => this.requireTable().put(recordId, stored)).catch(() => {})
-		return stored
+		if (stored !== undefined) {
+			if (local === undefined) await writeWithRetry(() => this.requireTable().put(recordId, stored)).catch(() => {})
+			return stored
+		}
+		// Absence on a READABLE medium is a deletion, not a failed read. Falling
+		// back to this process's snapshot here is exactly how a record another
+		// process deleted comes back to life — and gets written to disk again.
+		if (await this.storeReadable()) {
+			if (local !== undefined) await writeWithRetry(() => this.requireTable().delete(recordId)).catch(() => {})
+			return undefined
+		}
+		return local
+	}
+
+	/** Whether the store's record documents can be listed, i.e. the medium is the authority. */
+	async storeReadable() {
+		try {
+			await readdir(this.recordsDir)
+			return true
+		} catch {
+			return false
+		}
 	}
 
 	/**
@@ -885,7 +977,7 @@ class ProjectMemory extends Service {
 			return ''
 		}
 		if (result.error !== undefined) {
-			this.recallHook('recall-skipped', { session_id: agent.session.id, problem: result.error })
+			this.recallHook('recall-skipped', { session_id: agent.session.id, project: projectIdOf(agent.session.header?.cwd), problem: result.error })
 			return ''
 		}
 		if (result.records.length === 0) {
@@ -901,7 +993,12 @@ class ProjectMemory extends Service {
 		const blocks = result.records.map((entry, index) => renderRecord(entry.record, entry.hit, index + 1, this.config.perRecordChars))
 		let text = 'Project Memory (project: ' + result.project + ') — ' + blocks.length + ' of ' + result.considered + ' relevant record(s) recalled for this task.'
 		for (const block of blocks) text += '\n\n' + block
-		if (text.length > this.config.maxRecallChars) text = text.slice(0, this.config.maxRecallChars) + '\n\u2026[recall truncated]'
+		if (text.length > this.config.maxRecallChars) {
+			// The marker is part of the budget; slicing to the budget and THEN
+			// appending it overshot the configured number by its own length.
+			const marker = '\n\u2026[recall truncated]'
+			text = text.slice(0, Math.max(0, this.config.maxRecallChars - marker.length)) + marker
+		}
 		this.recallHook('recall-injected', {
 			session_id: agent.session.id,
 			project: result.project,
@@ -922,7 +1019,10 @@ class ProjectMemory extends Service {
 	 * @param fields - the auditable facts.
 	 */
 	recallHook(action, fields) {
-		const entry = { time: Date.now(), action, ...fields }
+		// The event name wins over the payload. A payload field named `action`
+		// used to overwrite it, so every `write-conflict` recorded here was
+		// unfindable by the query that exists to find it.
+		const entry = { ...fields, time: Date.now(), action }
 		this.audit.push(entry)
 		if (this.audit.length > this.config.auditLimit) this.audit.splice(0, this.audit.length - this.config.auditLimit)
 		if (this.config.debug) this.ctx.logger.info('project memory: ' + action + ' ' + JSON.stringify(entry))
@@ -966,7 +1066,7 @@ class ProjectMemory extends Service {
 			session_id: origin.session_id ?? '',
 			cwd: origin.cwd ?? '',
 		}
-		return this.withProjectWrite(record.project, { record: id, action: 'record' }, async () => {
+		return this.withProjectWrite(record.project, { record: id, operation: 'record' }, async () => {
 			await writeWithRetry(() => table.put(id, record))
 			await this.reindex(record.project)
 			return record
@@ -983,11 +1083,16 @@ class ProjectMemory extends Service {
 	async markRevised(recordId, status, supersededBy) {
 		const existing = await this.resolveRecord(recordId)
 		if (existing === undefined) throw new Error('no project memory record "' + recordId + '"')
-		return this.withProjectWrite(existing.project, { record: recordId, action: 'revise' }, async () => {
+		return this.withProjectWrite(existing.project, { record: recordId, operation: 'revise' }, async () => {
 			// Under the lease the medium is authoritative: the revision this process
 			// remembers may predate a rival's update, and bumping that stale number is
 			// exactly how an update disappears.
-			const current = (await this.readStoredRecord(recordId)) ?? existing
+			const stored = await this.readStoredRecord(recordId)
+			if (stored === undefined && await this.storeReadable()) {
+				await writeWithRetry(() => this.requireTable().delete(recordId)).catch(() => {})
+				throw new Error('no project memory record "' + recordId + '" (another process deleted it)')
+			}
+			const current = stored ?? existing
 			const revision = typeof current.revision === 'number' ? current.revision : 1
 			const updated = {
 				...current,
@@ -1016,7 +1121,7 @@ class ProjectMemory extends Service {
 	async forget(recordId) {
 		const record = await this.resolveRecord(recordId)
 		if (record === undefined) return undefined
-		return this.withProjectWrite(record.project, { record: recordId, action: 'forget' }, async () => {
+		return this.withProjectWrite(record.project, { record: recordId, operation: 'forget' }, async () => {
 			await writeWithRetry(() => this.requireTable().delete(recordId))
 			await this.reindex(record.project)
 			return record
@@ -1030,9 +1135,7 @@ class ProjectMemory extends Service {
 	async reindex(project) {
 		const table = this.requireTable()
 		// Two processes share the store but not their memories, so a rival's
-		// records must come from the medium. The medium is UNIONED with memory
-		// rather than trusted outright: a store this process cannot see whole
-		// (another backend, a moved root) must not be able to empty a good index.
+		// records — AND a rival's deletions — have to come from the medium.
 		const stored = await this.listStoredRecords()
 		const ids = []
 		const stamps = new Map()
@@ -1041,8 +1144,11 @@ class ProjectMemory extends Service {
 			ids.push(record.id)
 			stamps.set(record.id, typeof record.created_at === 'number' ? record.created_at : 0)
 		}
-		for (const [, record] of table.entries()) add(record)
-		for (const record of stored ?? []) add(record)
+		// When the store reads whole it is the authority: unioning it with this
+		// process's snapshot is what put a deleted record back into the index. The
+		// memory fallback exists only for a store that cannot be read at all.
+		if (stored === undefined) for (const [, record] of table.entries()) add(record)
+		else for (const record of stored) add(record)
 		ids.sort((left, right) => (stamps.get(right) ?? 0) - (stamps.get(left) ?? 0) || compareNames(left, right))
 		await writeWithRetry(() => this.indexTable.put(project, { ids }))
 	}
@@ -1058,7 +1164,7 @@ class ProjectMemory extends Service {
 
 	/** The owning session of one tool execution, or a fail-loud error. */
 	sessionOf(exec) {
-		const session = exec.agent?.session
+		const session = exec?.agent?.session
 		if (session === undefined || session === null) throw new Error('this tool requires an owning agent session')
 		return session
 	}
@@ -1360,7 +1466,10 @@ function installCorrectTool(service) {
 			const session = service.sessionOf(exec)
 			const cwd = session.header?.cwd
 			const project = projectIdOf(cwd)
-			const existing = service.get(args.record_id)
+			// Without a determinable project the ownership check below cannot run,
+			// and a session with no cwd could revise any project's records.
+			if (project === undefined) throw new Error('memory_correct requires a session whose header carries a cwd')
+			const existing = await service.resolveRecord(args.record_id)
 			if (existing === undefined) throw new Error('memory_correct: no record "' + args.record_id + '"')
 			const replacementProblem = squeeze(args.new_problem ?? '')
 			// A conclusion is only "corrected" or "superseded" IN FAVOUR of a
@@ -1370,7 +1479,7 @@ function installCorrectTool(service) {
 			if ((args.status === 'superseded' || args.status === 'corrected') && replacementProblem.length === 0) {
 				throw new Error('memory_correct: status "' + args.status + '" requires a replacement — supply new_problem (with new_root_cause, and new_verification to record it as verified). Use "invalidated" to reject a conclusion outright, or "confirmed" to affirm it.')
 			}
-			if (project !== undefined && existing.project !== project) {
+			if (existing.project !== project) {
 				throw new Error('memory_correct: record "' + args.record_id + '" belongs to another project (' + existing.project + ')')
 			}
 			let replacement
@@ -1401,6 +1510,7 @@ function installCorrectTool(service) {
 			const revised = await service.markRevised(existing.id, args.status, replacement?.id)
 			service.recallHook('record-revised', {
 				record_id: revised.id,
+				project: revised.project,
 				status: revised.status,
 				replacement_id: replacement?.id,
 				reason: clip(args.reason, 300),
@@ -1490,8 +1600,8 @@ function installAuditTool(service) {
 		].join(' '),
 		parameters: {
 			limit: { type: 'integer', description: 'Maximum entries, newest last (default 20).' },
-			action: { type: 'string', description: 'Only entries with this action (recall-injected, recall-empty, recall-skipped, explicit-search, record-created, record-revised).' },
-			project: { type: 'string', description: 'Only entries for one project id.' },
+			action: { type: 'string', description: 'Only entries with this action (recall-injected, recall-empty, recall-skipped, explicit-search, record-created, record-revised, record-forgotten, write-conflict, write-bypass, write-lease-unavailable).' },
+			project: { type: 'string', description: "Only entries for one project id; must be this session's own project." },
 		},
 		output: {
 			schema: {
@@ -1507,11 +1617,20 @@ function installAuditTool(service) {
 				text: value.count === 0 ? 'No project-memory audit entries.' : JSON.stringify(value.entries, null, 2),
 			}],
 		},
-		async execute(args) {
+		async execute(args, exec) {
+			const session = service.sessionOf(exec)
+			const project = projectIdOf(session.header?.cwd)
+			if (project === undefined) throw new Error('memory_audit requires a session whose header carries a cwd')
+			if (typeof args.project === 'string' && args.project.length > 0 && args.project !== project) {
+				throw new Error("memory_audit: this tool reads only the audit of the session's own project")
+			}
 			const limit = typeof args.limit === 'number' && args.limit > 0 ? Math.min(args.limit, 200) : 20
+			// The trail spans every project this process serves and the tool is
+			// model-facing, so a session must never read another project's problems
+			// or queries through it. Cross-project inspection reads the store itself.
 			const filtered = service.audit.filter((entry) => {
+				if (entry.project !== project) return false
 				if (typeof args.action === 'string' && args.action.length > 0 && entry.action !== args.action) return false
-				if (typeof args.project === 'string' && args.project.length > 0 && entry.project !== args.project) return false
 				return true
 			})
 			return { count: Math.min(filtered.length, limit), entries: filtered.slice(-limit) }

@@ -29,7 +29,7 @@ import { projectIdOf } from './index.js'
 const HERE = dirname(fileURLToPath(import.meta.url))
 const PLUGIN = new URL('./index.js', import.meta.url).href
 const DEFAULT_HOME = (process.env.USERPROFILE ?? process.env.HOME ?? '.') + '/.dsh'
-const HARNESS_BASE = pathToFileURL((process.env.DSH_HOME ?? DEFAULT_HOME) + '/profiles/node_modules/').href
+const HARNESS_BASE = pathToFileURL(process.env.DSH_PLUGIN_DEPS ?? (process.env.DSH_HOME ?? DEFAULT_HOME) + '/profiles/node_modules/').href
 const N = 40
 const CWD = 'C:\\work\\lease-project'
 const DOMAIN_DIR = 'dsh_project_memory'

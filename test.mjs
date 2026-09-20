@@ -26,7 +26,7 @@ import { medium } from './memory-backend.mjs'
 const PLUGIN = new URL('./index.js', import.meta.url).href
 /** Bare `@deepseek-ai/*` names in this composition resolve from the installed harness. */
 const DEFAULT_HOME = (process.env.USERPROFILE ?? process.env.HOME ?? '.') + '/.dsh'
-const HARNESS_BASE = pathToFileURL((process.env.DSH_HOME ?? DEFAULT_HOME) + '/profiles/node_modules/').href
+const HARNESS_BASE = pathToFileURL(process.env.DSH_PLUGIN_DEPS ?? (process.env.DSH_HOME ?? DEFAULT_HOME) + '/profiles/node_modules/').href
 
 let failures = 0
 let checks = 0

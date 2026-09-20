@@ -11,12 +11,11 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { Context } from '@deepseek-ai/cordis'
-import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
 
 const HERE = new URL('.', import.meta.url)
 const PLUGIN = new URL('./index.js', import.meta.url).href
 const BACKEND = new URL('./memory-backend.mjs', import.meta.url).href
-const HARNESS_BASE = pathToFileURL(dshHomePath('profiles', 'node_modules') + '/').href
+const HARNESS_BASE = pathToFileURL(process.env.DSH_PLUGIN_DEPS).href
 
 let failures = 0
 let checks = 0

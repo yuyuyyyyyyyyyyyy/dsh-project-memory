@@ -23,7 +23,7 @@ import { projectIdOf } from './index.js'
 
 const PLUGIN = new URL('./index.js', import.meta.url).href
 const DEFAULT_HOME = (process.env.USERPROFILE ?? process.env.HOME ?? '.') + '/.dsh'
-const HARNESS_BASE = pathToFileURL((process.env.DSH_HOME ?? DEFAULT_HOME) + '/profiles/node_modules/').href
+const HARNESS_BASE = pathToFileURL(process.env.DSH_PLUGIN_DEPS ?? (process.env.DSH_HOME ?? DEFAULT_HOME) + '/profiles/node_modules/').href
 const DOMAIN_DIR = 'dsh_project_memory'
 const CWD = 'C:\\work\\consistency-project'
 const OTHER_CWD = 'C:\\work\\some-other-project'

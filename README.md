@@ -18,6 +18,15 @@ a guess becomes "history".
 One host-plane Cordis plugin. It changes nothing in the shipped harness: no core
 package is patched, no shipped preset is copied or edited.
 
+### There is no mode to select
+
+Because the row is host-plane, it is already active in **every** agent preset —
+`standard`, `ptc`, `minimal`, `cordis`, and any preset you author yourself.
+There is no `project-memory` preset to pick in the mode selector, and authoring
+one would be a step backwards: a preset realm gets its own instance, so a
+per-preset copy would stop being shared across presets. If an earlier install
+left such a preset behind, delete it — nothing depends on it.
+
 | Contribution | Hook | Why |
 | --- | --- | --- |
 | `projectMemory` service | host plane | Records back every session of a project; a per-session (preset realm) instance would defeat the feature |
